@@ -103,5 +103,4 @@ using LinearAlgebra
   # Exner function. FIXME: add correctness tests
   p=1.e5; q_t=0.23
   @test exner(p, q_t) isa typeof(p)
-
 end
