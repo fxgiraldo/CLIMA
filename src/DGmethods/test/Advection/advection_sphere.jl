@@ -67,7 +67,8 @@ end
 #}}} Cartesian->Spherical
 
 #{{{ numericalflux
-numericalflux!(F, nM, QM, auxM, QP, auxP, t) = NumericalFluxes.rusanov!(F, nM, QM, auxM, QP, auxP, t, advectionflux!, advectionspeed)
+numerical_flux!(F, nM, QM, auxM, QP, auxP, t) = NumericalFluxes.rusanov!(F, nM, QM, auxM, QP, auxP, t, advectionflux!, advectionspeed)
+numerical_boundary_flux!(F, _...) =  F.=0
 #}}} numericalflux
 
 #{{{ velocity initial condition
@@ -97,7 +98,8 @@ function main(mpicomm, DFloat, topl, N, timeend, ArrayType, dt)
     spacedisc=DGBalanceLaw(grid = grid,
                            length_state_vector = 1,
                            inviscid_flux! = advectionflux!,
-                           inviscid_numericalflux! = numericalflux!,
+                           inviscid_numerical_flux! = numerical_flux!,
+                           inviscid_numerical_boundary_flux! = numerical_boundary_flux!,
                            auxiliary_state_length = 3,
                            auxiliary_state_initialization! = velocity_init!)
     DGBalanceLawDiscretizations.writevtk("vtk/velocity_sphere", spacedisc.auxstate, spacedisc, ("u", "v", "w"))
