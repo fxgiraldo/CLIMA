@@ -3,7 +3,7 @@ using LinearAlgebra
 
 using MPI
 
-export MPIStateArray, euclidean_distance
+export MPIStateArray, euclidean_distance, weighted_sum
 
 """
     MPIStateArray{S <: Tuple, T, DeviceArray, N,
@@ -333,6 +333,34 @@ function knl_L2dist(::Val{Np}, A, B, weights, elems) where {Np}
   end
 
   dist
+end
+
+function weighted_sum(A::MPIStateArray)
+
+  host_array = Array ∈ typeof(A).parameters
+  h_A = host_array ? A : Array(A)
+  Np = size(A, 1)
+
+  if isempty(A.weights)
+    error("weights not defined")
+  else
+    locsum = knl_weighted_sum(Val(Np), h_A, A.weights, A.realelems)
+  end
+
+  MPI.Allreduce([locsum], MPI.SUM, A.mpicomm)[1]
+end
+
+function knl_weighted_sum(::Val{Np}, A, weights, elems) where {Np}
+  DFloat = eltype(A)
+  (_, nstate, nelem) = size(A)
+
+  sumval = zero(DFloat)
+
+  @inbounds for e = elems, q = 1:nstate, i = 1:Np
+    sumval += weights[i, e] * A[i, q, e]
+  end
+
+  sumval
 end
 
 # }}}

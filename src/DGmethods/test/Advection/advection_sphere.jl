@@ -14,6 +14,8 @@ Sys.iswindows() || (isinteractive() && MPI.finalize_atexit())
 
 const uid, vid, wid = 1:3
 
+const integration_testing = true
+
 #{{{ advectionflux
 @inline function advectionflux!(F,Q,aux,t)
     @inbounds begin
@@ -49,26 +51,26 @@ end
     ϕ=asin(z/r)*c
 
     #Stay within bounds
-#=    if (λ < λ_min)
-        λ = λ + λ_max
+    #=    if (λ < λ_min)
+    λ = λ + λ_max
     end
     if (λ > λ_max)
-        λ = λ - λ_max
+    λ = λ - λ_max
     end
     if (ϕ < ϕ_min)
-        ϕ = ϕ + ϕ_max
+    ϕ = ϕ + ϕ_max
     end
     if (ϕ > ϕ_max)
-        ϕ = ϕ - ϕ_max
+    ϕ = ϕ - ϕ_max
     end
     =#
-    return r, λ, ϕ
+    return (r, λ, ϕ)
 end
 #}}} Cartesian->Spherical
 
 #{{{ numericalflux
 numerical_flux!(F, nM, QM, auxM, QP, auxP, t) = NumericalFluxes.rusanov!(F, nM, QM, auxM, QP, auxP, t, advectionflux!, advectionspeed)
-numerical_boundary_flux!(F, _...) =  F.=0
+numerical_boundary_flux!(F, _...) =  F.=0 #zero flux at the boundaries
 #}}} numericalflux
 
 #{{{ velocity initial condition
@@ -88,11 +90,11 @@ end
 
 #{{{ Main
 function main(mpicomm, DFloat, topl, N, timeend, ArrayType, dt)
-  grid = DiscontinuousSpectralElementGrid(topl,
-                                          FloatType = DFloat,
-                                          DeviceArray = ArrayType,
-                                          polynomialorder = N,
-                                          meshwarp = Topologies.cubedshellwarp)
+    grid = DiscontinuousSpectralElementGrid(topl,
+                                            FloatType = DFloat,
+                                            DeviceArray = ArrayType,
+                                            polynomialorder = N,
+                                            meshwarp = Topologies.cubedshellwarp)
 
     #Define Spatial Discretization
     spacedisc=DGBalanceLaw(grid = grid,
@@ -107,51 +109,86 @@ function main(mpicomm, DFloat, topl, N, timeend, ArrayType, dt)
     Q = MPIStateArray(spacedisc) do Q, x, y, z, vel
         @inbounds begin
             DFloat = eltype(vel)
+            rc=1.5
             (r, λ, ϕ) = cartesian_to_spherical(x,y,z,"radians")
-            Q[1] = exp(-((3λ)^2 + (3ϕ)^2))
+            if (abs(r-rc) <= 0.25)
+                Q[1] = exp(-((3λ)^2 + (3ϕ)^2))
+            else
+                Q[1]=0
+            end
         end
     end
+
+    #Store Initial Condition as Exact Solution
+    Qe = copy(Q)
+
     DGBalanceLawDiscretizations.writevtk("vtk/ic_sphere", Q, spacedisc, ("ρ",))
-  lsrk = LowStorageRungeKutta(spacedisc, Q; dt = dt, t0 = 0)
+    lsrk = LowStorageRungeKutta(spacedisc, Q; dt = dt, t0 = 0)
 
-  io = MPI.Comm_rank(mpicomm) == 0 ? stdout : devnull
-  eng0 = norm(Q)
-  @printf(io, "----\n")
-  @printf(io, "||Q||₂ (initial) =  %.16e\n", eng0)
+    io = MPI.Comm_rank(mpicomm) == 0 ? stdout : devnull
+    eng0 = norm(Q)
+    @printf(io, "----\n")
+    @printf(io, "||Q||₂ (initial) =  %.16e\n", eng0)
 
-  # Set up the information callback
-  timer = [time_ns()]
-  cbinfo = GenericCallbacks.EveryXWallTimeSeconds(10, mpicomm) do (s=false)
-      if s
-          timer[1] = time_ns()
-      else
-          run_time = (time_ns() - timer[1]) * 1e-9
-          (min, sec) = fldmod(run_time, 60)
-          (hrs, min) = fldmod(min, 60)
-          @printf(io, "----\n")
-          @printf(io, "simtime =  %.16e\n", ODESolvers.gettime(lsrk))
-          @printf(io, "runtime =  %03d:%02d:%05.2f (hour:min:sec)\n", hrs, min, sec)
-          @printf(io, "||Q||₂  =  %.16e\n", norm(Q))
-      end
-      nothing
-  end
+    # Set up the information callback
+    timer = [time_ns()]
+    cbinfo = GenericCallbacks.EveryXWallTimeSeconds(10, mpicomm) do (s=false)
+        if s
+            timer[1] = time_ns()
+        else
+            run_time = (time_ns() - timer[1]) * 1e-9
+            (min, sec) = fldmod(run_time, 60)
+            (hrs, min) = fldmod(min, 60)
+            @printf(io, "----\n")
+            @printf(io, "simtime =  %.16e\n", ODESolvers.gettime(lsrk))
+            @printf(io, "runtime =  %03d:%02d:%05.2f (hour:min:sec)\n", hrs, min, sec)
+            @printf(io, "||Q||₂  =  %.16e\n", norm(Q))
+            @printf(io, "|Mass_Final - Mass_Initial|/Mass_initial =  %.16e\n", abs(weighted_sum(Q) - weighted_sum(Qe))/ weighted_sum(Qe) )
+        end
+        nothing
+    end
 
-  step = [0]
-  mkpath("vtk")
-  cbvtk = GenericCallbacks.EveryXSimulationSteps(100) do (init=false)
-      outprefix = @sprintf("vtk/advection_sphere_%dD_mpirank%04d_step%04d",
+    # Set up the information callback
+    cbmass = GenericCallbacks.EveryXSimulationSteps(1) do
+        @printf(io, "----\n")
+        @printf(io, "|Mass_Final - Mass_Initial|/Mass_initial =  %.16e\n", abs(weighted_sum(Q) - weighted_sum(Qe))/ weighted_sum(Qe) )
+        nothing
+    end
+
+    step = [0]
+    mkpath("vtk")
+    cbvtk = GenericCallbacks.EveryXSimulationSteps(100) do (init=false)
+        outprefix = @sprintf("vtk/advection_sphere_%dD_mpirank%04d_step%04d",
                              3, MPI.Comm_rank(mpicomm), step[1])
-      @printf(io, "----\n")
-      @printf(io, "doing VTK output =  %s\n", outprefix)
-      DGBalanceLawDiscretizations.writevtk(outprefix, Q, spacedisc, ("ρ", ))
-      step[1] += 1
-      nothing
-  end
+        @printf(io, "----\n")
+        @printf(io, "doing VTK output =  %s\n", outprefix)
+        DGBalanceLawDiscretizations.writevtk(outprefix, Q, spacedisc, ("ρ", ))
+        step[1] += 1
+        nothing
+    end
 
-  solve!(Q, lsrk; timeend=timeend, callbacks=(cbinfo, cbvtk))
+    solve!(Q, lsrk; timeend=timeend, callbacks=(cbinfo, cbmass, cbvtk))
 
-  DGBalanceLawDiscretizations.writevtk("vtk/velocity_final_sphere", spacedisc.auxstate,
-                                       spacedisc, ("u", "v", "w"))
+    DGBalanceLawDiscretizations.writevtk("vtk/velocity_final_sphere", spacedisc.auxstate, spacedisc, ("u", "v", "w"))
+
+    # Print some end of the simulation information
+    if integration_testing
+        Qe = MPIStateArray(spacedisc) do Qe, x, y, z, vel
+            @inbounds begin
+                DFloat = eltype(vel)
+                (r, λ, ϕ) = cartesian_to_spherical(x,y,z,"radians")
+                Qe[1] = exp(-((3λ)^2 + (3ϕ)^2))
+            end
+        end
+        engfe = norm(Qe)
+        errf = euclidean_distance(Q, Qe)
+        mass_initial = weighted_sum(Qe)
+        mass_final   = weighted_sum(Q)
+        @info @sprintf """Finished
+        norm(Q - Qe) / norm(Qe) = %.16e
+        (Mass_Final - Mass_Initial) / Mass_Initial = %.16e
+        """ errf / engfe abs(mass_final - mass_initial) / mass_initial
+    end
 
 end
 #}}} Main
