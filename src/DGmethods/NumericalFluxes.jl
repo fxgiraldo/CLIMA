@@ -100,8 +100,9 @@ function rusanov_boundary_flux!(F::MArray{Tuple{nstate}}, nM,
                                 preflux = (_...) -> (),
                                 correctQ! = nothing
                                ) where {nstate}
+
   PM = preflux(QM, auxM, t)
-  PP = bcstate!(QP, auxP, QM, auxM, bctype, t, PM...)
+  PP = bcstate!(QP, auxP, QM, auxM, nM, bctype, t, PM...)
   PP === nothing && (PP = preflux(QP, auxP, t))
   rusanov!(F, nM, QM, auxM, QP, auxP, t, flux!, wavespeed, preflux, correctQ!,
            PM, PP)

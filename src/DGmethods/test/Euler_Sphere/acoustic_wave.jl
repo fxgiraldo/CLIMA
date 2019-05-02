@@ -125,6 +125,33 @@ euler_flux!(F, Q, aux, t) = euler_flux!(F, Q, aux, t, preflux(Q)...)
   end
 end
 
+@inline function bcstate!(QP, _, QM, auxM, nM, bctype, t,  PM, uM, vM, wM, ρMinv)
+    DFloat = eltype(QM)
+    γ:: DFloat = γ_exact
+    @inbounds begin
+        if bctype == 1 #no-flux
+            #Store values at left of boundary ("-" values)
+            ρM, UM, VM, WM, EM = QM[_ρ], QM[_U], QM[_V], QM[_W], QM[_E]
+            ϕM=auxM[_a_ϕ]
+
+            #Scalars are the same on both sides of the boundary
+            ρP=ρM; PP=PM; ϕP=ϕM
+            nx, ny, nz = nM[1], nM[2], nM[3]
+
+            #reflect velocities
+            uN=nx*uM + ny*vM + nz*wM
+            uP=uM - 2*uN*nx
+            vP=vM - 2*uN*ny
+            wP=wM - 2*uN*nz
+
+            #Construct QP state
+            QP[_ρ], QP[_U], QP[_V], QP[_W] = ρP, ρP*uP, ρP*vP, ρP*wP
+            QP[_E]= PP/(γ-1) + 0.5*ρP*( uP^2 + vP^2 + wP^2) + ρP*ϕP
+        end
+    nothing
+  end
+end
+
 # initial condition
 function acoustic_wave!(Q, t, x, y, z, aux, _...)
     DFloat = eltype(Q)
@@ -153,9 +180,10 @@ function acoustic_wave!(Q, t, x, y, z, aux, _...)
 
     #Pressure Perturbation
     r1 = a*acos(cosϕ*cosλ)
-    f = 0
     if (r1 < R_pert)
         f = 0.5*(1 + cos(π*r1/R_pert))
+    else
+        f = 0
     end
 
     #vertical profile
@@ -166,23 +194,21 @@ function acoustic_wave!(Q, t, x, y, z, aux, _...)
         g = sin(nv*π*h/ztop)
     end
     =#
+#    g = 2/(π*nv)
     g = sin(nv*π*h/ztop)
-    g = 1
 
     dp = 100*f*g #Original
     p = p_ref + dp
     ρ = p00/(rgas*θ_ref)*(p/p00)^(cv/cp)
-    if dp > 0
-        println(" h= ",h," x=",x/r," y=",y/r," z=",z/r," dp=",dp," dρ=",ρ-ρ_ref)
-    end
 
     #Fields
     ϕ = aux[_a_ϕ]
+    ###Debug
     u, v, w = 0, 0, 0
     U = ρ*u
     V = ρ*v
     W = ρ*w
-    E = p/(γ-1) + (1//2)*ρ*(u^2 + v^2 + w^2) + ρ*ϕ
+    E = p/(γ-1) + 0.5*ρ*(u^2 + v^2 + w^2) + ρ*ϕ
 
     #Store Initial conditions
     @inbounds Q[_ρ], Q[_U], Q[_V], Q[_W], Q[_E] = ρ, U, V, W, E
@@ -198,26 +224,23 @@ function main(mpicomm, DFloat, topl, N, timeend, ArrayType, dt)
                                             meshwarp = Topologies.cubedshellwarp)
 
     # spacedisc = data needed for evaluating the right-hand side function
+    numflux!(x...) = NumericalFluxes.rusanov!(x..., euler_flux!, wavespeed,
+                                              preflux)
+    numbcflux!(x...) = NumericalFluxes.rusanov_boundary_flux!(x..., euler_flux!,
+                                                              bcstate!, wavespeed,
+                                                              preflux)
     spacedisc = DGBalanceLaw(grid = grid,
                              length_state_vector = _nstate,
                              inviscid_flux! = euler_flux!,
-                             inviscid_numerical_flux! = (x...) ->
-                             NumericalFluxes.rusanov!(x..., euler_flux!,
-                                                      wavespeed,
-                                                      preflux),
-                             inviscid_numerical_boundary_flux! = (x...) ->
-                             NumericalFluxes.rusanov!(x..., euler_flux!,
-                                                      wavespeed,
-                                                      preflux),
+                             inviscid_numerical_flux! = numflux!,
+                             inviscid_numerical_boundary_flux! = numbcflux!,
                              auxiliary_state_length = _nauxstate,
-                             auxiliary_state_initialization! =
-                             auxiliary_state_initialization!,
+                             auxiliary_state_initialization! = auxiliary_state_initialization!,
                              source! = euler_source!)
 
-    DGBalanceLawDiscretizations.grad_auxiliary_state!(spacedisc, _a_ϕ,
-                                                      (_a_ϕx, _a_ϕy, _a_ϕz))
+    DGBalanceLawDiscretizations.grad_auxiliary_state!(spacedisc, _a_ϕ, (_a_ϕx, _a_ϕy, _a_ϕz))
 
-    # This is a actual state/function that lives on the grid
+    # This is an actual state/function that lives on the grid
     initialcondition(Q, x...) = acoustic_wave!(Q, DFloat(0), x...)
     Q = MPIStateArray(spacedisc, initialcondition)
 
@@ -250,6 +273,8 @@ function main(mpicomm, DFloat, topl, N, timeend, ArrayType, dt)
         @printf(io, "----\n")
         @printf(io, "simtime =  %.16e\n", ODESolvers.gettime(lsrk))
         @printf(io, "|Mass_Final - Mass_Initial|/Mass_initial =  %.16e\n", abs(weighted_sum(Q) - weighted_sum(Qe))/ weighted_sum(Qe) )
+        @printf(io, "Mass_initial =  %.16e\n", weighted_sum(Qe) )
+        @printf(io, "Mass_Final   =  %.16e\n", weighted_sum(Q) )
         nothing
     end
 
@@ -286,13 +311,13 @@ let
     N=4
     ArrayType = Array
     dt=1
-    timeend=1
+    timeend=100
     Nhorz = 5 #number of horizontal elements per face of cubed-sphere grid
     Nvert = 5 #number of horizontal elements per face of cubed-sphere grid
     height_min=earth_radius
     height_max=earth_radius + ztop
     Rrange=range(DFloat(height_min); length=Nhorz+1, stop=height_max)
-    topl = StackedCubedSphereTopology(mpicomm,Nhorz,Rrange; bc=(0,0))
+    topl = StackedCubedSphereTopology(mpicomm,Nhorz,Rrange; bc=(1,1))
     main(mpicomm, DFloat, topl, N, timeend, ArrayType, dt)
 end
 #}}} Run Program
